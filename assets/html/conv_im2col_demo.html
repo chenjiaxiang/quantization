@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>卷积 ≡ 矩阵乘（im2col + GEMM）交互演示</title>
+<style>
+  :root { --bg:#0b1021; --card:#121837; --text:#e8ecff; --muted:#9aa3c7; --accent:#6da3ff; --ok:#7ef0a7; --bad:#ff7b7b;}
+  body{font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, PingFang SC, Noto Sans CJK, Helvetica, Arial;
+       background:var(--bg); color:var(--text); margin:0; padding:2rem;}
+  h1{font-size:1.6rem; margin:0 0 1rem}
+  .wrap{display:grid; grid-template-columns: 320px 1fr; gap:1rem; align-items:start}
+  .card{background:var(--card); padding:1rem 1.2rem; border-radius:16px; box-shadow: 0 6px 20px rgba(0,0,0,.25)}
+  .controls label{display:block; margin: .5rem 0 .15rem; color:var(--muted); font-size:.9rem}
+  .controls input[type="number"]{width:100%; padding:.5rem .6rem; border-radius:10px; border:1px solid #2b3566; background:#0f1530; color:var(--text)}
+  .controls .row{display:grid; grid-template-columns:1fr 1fr; gap:.6rem}
+  .btn{background:linear-gradient(135deg, #4064ff, #55a3ff); border:none; color:white; padding:.65rem 1rem; border-radius:12px; cursor:pointer; margin-top:.8rem; font-weight:600}
+  .btn.secondary{background:#1a2250}
+  .grid{display:inline-grid; gap:2px; background:#2b3566; padding:2px; border-radius:8px; vertical-align:top}
+  .cell{background:#0f1530; min-width:32px; min-height:32px; display:flex; align-items:center; justify-content:center;
+        border-radius:6px; font: 600 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; color:#cfe0ff}
+  .mat-scroll{max-width:100%; overflow:auto; border:1px solid #2b3566; border-radius:10px}
+  table{border-collapse:separate; border-spacing:0; margin:.2rem 0}
+  th, td{border:1px solid #2b3566; padding:.35rem .5rem; font: 600 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; color:#cfe0ff}
+  th{background:#1a2250; position:sticky; top:0}
+  .legend{color:var(--muted); font-size:.85rem; margin:.5rem 0}
+  .status{margin-top:.5rem; font-weight:700}
+  .ok{color:var(--ok)}
+  .bad{color:var(--bad)}
+  .cols{display:grid; grid-template-columns: repeat(auto-fit, minmax(210px,1fr)); gap:1rem}
+  details{margin:.5rem 0}
+  summary{cursor:pointer; color:#c8d7ff}
+  .small{font-size:.9rem; color:var(--muted)}
+</style>
+</head>
+<body>
+  <h1>卷积 ≡ 矩阵乘（im2col + GEMM）交互演示</h1>
+  <div class="wrap">
+    <div class="card controls">
+      <div class="small">本页面用 <b>二维单通道</b> 卷积举例，展示如何把卷积变成一次矩阵乘法：<code>Y_col = (K_flat)^T · X_col</code>，再把 <code>Y_col</code> 还原为输出特征图。</div>
+      <label>输入尺寸 H × W</label>
+      <div class="row">
+        <input id="H" type="number" value="4" min="1" max="8"/>
+        <input id="W" type="number" value="4" min="1" max="8"/>
+      </div>
+      <label>卷积核尺寸 kH × kW</label>
+      <div class="row">
+        <input id="kH" type="number" value="3" min="1" max="5"/>
+        <input id="kW" type="number" value="3" min="1" max="5"/>
+      </div>
+      <label>步幅 stride（sh, sw）</label>
+      <div class="row">
+        <input id="sH" type="number" value="1" min="1" max="4"/>
+        <input id="sW" type="number" value="1" min="1" max="4"/>
+      </div>
+      <label>填充 padding（ph, pw）</label>
+      <div class="row">
+        <input id="pH" type="number" value="0" min="0" max="3"/>
+        <input id="pW" type="number" value="0" min="0" max="3"/>
+      </div>
+      <label>扩张 dilation（dh, dw）</label>
+      <div class="row">
+        <input id="dH" type="number" value="1" min="1" max="3"/>
+        <input id="dW" type="number" value="1" min="1" max="3"/>
+      </div>
+      <button class="btn" id="randomize">随机输入/卷积核</button>
+      <button class="btn secondary" id="compute">计算 & 验证等价</button>
+      <div class="status" id="status"></div>
+      <details>
+        <summary>说明</summary>
+        <div class="small">
+          将输入 <code>X ∈ ℝ^{H×W}</code> 以滑窗方式展开为 <code>X_col ∈ ℝ^{(kH·kW) × (OH·OW)}</code>；
+          将核 <code>K ∈ ℝ^{kH×kW}</code> 展平成 <code>K_flat ∈ ℝ^{(kH·kW)}</code>。
+          则每个输出位置的卷积结果是一次点积：<code>y_j = K_flat^T · X_col[:, j]</code>（<i>j</i> 为滑窗索引）。
+          这等价于一次矩阵乘法（单输出通道时是向量与矩阵；多输出通道时堆叠为 <code>W ∈ ℝ^{C_out × (kH·kW)}</code> 与 <code>X_col</code> 的 GEMM）。
+        </div>
+      </details>
+    </div>
+    <div class="card">
+      <div class="cols">
+        <div>
+          <h3>输入 X</h3>
+          <div id="Xgrid"></div>
+        </div>
+        <div>
+          <h3>卷积核 K</h3>
+          <div id="Kgrid"></div>
+        </div>
+        <div>
+          <h3>im2col 矩阵 X_col</h3>
+          <div class="mat-scroll"><div id="Xcol"></div></div>
+        </div>
+        <div>
+          <h3>向量化核 K_flat</h3>
+          <div id="Kflat"></div>
+        </div>
+        <div>
+          <h3>GEMM 结果 Y_col 及重排</h3>
+          <div class="legend">先算 <code>Y_col = (K_flat)^T · X_col</code>，再 reshape → <code>Y ∈ ℝ^{OH×OW}</code></div>
+          <div id="Ycol"></div>
+          <h3 style="margin-top:.8rem">输出 Y（矩阵乘法路径）</h3>
+          <div id="Ygrid_matmul"></div>
+        </div>
+        <div>
+          <h3>输出 Y（直接卷积）</h3>
+          <div id="Ygrid_direct"></div>
+        </div>
+      </div>
+      <div class="status" id="compare"></div>
+    </div>
+  </div>
+
+<script>
+function zeros(h,w){const a=new Array(h); for(let i=0;i<h;i++){a[i]=new Array(w).fill(0)} return a}
+function randn(){ // simple uniform(-1,1) for demo
+  return Math.round((Math.random()*2-1)*100)/100
+}
+function makeGrid(container, mat){
+  const h=mat.length, w=mat[0].length
+  const grid=document.createElement('div')
+  grid.className='grid'
+  grid.style.gridTemplateColumns=`repeat(${w}, 36px)`
+  grid.style.gridTemplateRows=`repeat(${h}, 36px)`
+  for(let i=0;i<h;i++){
+    for(let j=0;j<w;j++){
+      const c=document.createElement('div')
+      c.className='cell'; c.textContent=mat[i][j].toFixed ? mat[i][j].toFixed(2) : mat[i][j]
+      grid.appendChild(c)
+    }
+  }
+  container.innerHTML=''; container.appendChild(grid)
+}
+function makeTable(container, mat){
+  const h=mat.length, w=mat[0].length
+  const tbl=document.createElement('table')
+  const thead=document.createElement('thead'); const trh=document.createElement('tr')
+  for(let j=0;j<w;j++){const th=document.createElement('th'); th.textContent=j; trh.appendChild(th)}
+  thead.appendChild(trh); tbl.appendChild(thead)
+  const tb=document.createElement('tbody')
+  for(let i=0;i<h;i++){
+    const tr=document.createElement('tr')
+    for(let j=0;j<w;j++){const td=document.createElement('td'); td.textContent=Number(mat[i][j]).toFixed(2); tr.appendChild(td)}
+    tb.appendChild(tr)
+  }
+  tbl.appendChild(tb)
+  container.innerHTML=''; container.appendChild(tbl)
+}
+function pad2d(X, ph, pw){
+  const H=X.length, W=X[0].length
+  const Y=zeros(H+2*ph, W+2*pw)
+  for(let i=0;i<H;i++){
+    for(let j=0;j<W;j++){
+      Y[i+ph][j+pw]=X[i][j]
+    }
+  }
+  return Y
+}
+function im2col2d(X, kH, kW, sH, sW, pH, pW, dH, dW){
+  const Xp=pad2d(X, pH, pW)
+  const H=Xp.length, W=Xp[0].length
+  const OH = Math.floor((H - (dH*(kH-1) + 1))/sH) + 1
+  const OW = Math.floor((W - (dW*(kW-1) + 1))/sW) + 1
+  const K = kH*kW
+  const cols=zeros(K, OH*OW)
+  let col=0
+  for(let oy=0; oy<OH; oy++){
+    for(let ox=0; ox<OW; ox++){
+      let idx=0
+      for(let ky=0; ky<kH; ky++){
+        for(let kx=0; kx<kW; kx++){
+          const iy = oy*sH + ky*dH
+          const ix = ox*sW + kx*dW
+          cols[idx++][col] = Xp[iy][ix]
+        }
+      }
+      col++
+    }
+  }
+  return {cols, OH, OW}
+}
+function directConv2d(X, K, sH,sW,pH,pW,dH,dW){
+  const Xp=pad2d(X,pH,pW)
+  const H=Xp.length, W=Xp[0].length
+  const kH=K.length, kW=K[0].length
+  const OH = Math.floor((H - (dH*(kH-1) + 1))/sH) + 1
+  const OW = Math.floor((W - (dW*(kW-1) + 1))/sW) + 1
+  const Y=zeros(OH, OW)
+  for(let oy=0; oy<OH; oy++){
+    for(let ox=0; ox<OW; ox++){
+      let acc=0
+      for(let ky=0; ky<kH; ky++){
+        for(let kx=0; kx<kW; kx++){
+          const iy = oy*sH + ky*dH
+          const ix = ox*sW + kx*dW
+          acc += Xp[iy][ix] * K[ky][kx]
+        }
+      }
+      Y[oy][ox]=acc
+    }
+  }
+  return Y
+}
+function dot(a,b){let s=0; for(let i=0;i<a.length;i++) s+=a[i]*b[i]; return s}
+function gemmVectorT_Kflat_times_Xcol(Kflat, Xcol){
+  const K = Kflat.length
+  const N = Xcol[0].length
+  const out = new Array(N).fill(0)
+  for(let j=0;j<N;j++){
+    let s=0
+    for(let i=0;i<K;i++){ s += Kflat[i]*Xcol[i][j] }
+    out[j]=s
+  }
+  return out // 1×N
+}
+function reshape1xN_to_OH_OW(vec, OH, OW){
+  const Y=zeros(OH,OW)
+  let t=0
+  for(let i=0;i<OH;i++)for(let j=0;j<OW;j++)Y[i][j]=vec[t++]
+  return Y
+}
+function almostEqual(a,b, eps=1e-6){ return Math.abs(a-b) <= eps }
+function compareMats(A,B, eps=1e-6){
+  const H=A.length, W=A[0].length
+  for(let i=0;i<H;i++) for(let j=0;j<W;j++){
+    if(!almostEqual(A[i][j], B[i][j], eps)) return false
+  }
+  return true
+}
+const el = id => document.getElementById(id)
+let X = zeros(4,4).map(row=>row.map(_=>randn()))
+let K = zeros(3,3).map(row=>row.map(_=>randn()))
+function renderAll(){
+  makeGrid(el('Xgrid'), X)
+  makeGrid(el('Kgrid'), K)
+  const kH=K.length, kW=K[0].length
+  const Kflat = K.flat()
+  makeTable(el('Kflat'), [Kflat])
+  // params
+  const H=parseInt(el('H').value), W=parseInt(el('W').value)
+  const sH=parseInt(el('sH').value), sW=parseInt(el('sW').value)
+  const pH=parseInt(el('pH').value), pW=parseInt(el('pW').value)
+  const dH=parseInt(el('dH').value), dW=parseInt(el('dW').value)
+  // resize X if changed
+  if (X.length!==H || X[0].length!==W){
+    X = zeros(H,W).map(row=>row.map(_=>randn()))
+    makeGrid(el('Xgrid'), X)
+  }
+  // recompute
+  const {cols, OH, OW} = im2col2d(X, kH, kW, sH, sW, pH, pW, dH, dW)
+  makeTable(el('Xcol'), cols)
+  const ycol = gemmVectorT_Kflat_times_Xcol(Kflat, cols)
+  makeTable(el('Ycol'), [ycol])
+  const Y1 = reshape1xN_to_OH_OW(ycol, OH, OW)
+  makeGrid(el('Ygrid_matmul'), Y1)
+  const Y2 = directConv2d(X, K, sH, sW, pH, pW, dH, dW)
+  makeGrid(el('Ygrid_direct'), Y2)
+  const ok = compareMats(Y1, Y2, 1e-6)
+  el('compare').innerHTML = ok ? `<span class="ok">✅ 数值一致：矩阵乘法路径 与 直接卷积 完全相同</span>`
+                                : `<span class="bad">❌ 未对齐（请检查参数/尺寸合法性）</span>`
+}
+el('randomize').onclick = ()=>{
+  const H=parseInt(el('H').value), W=parseInt(el('W').value)
+  const kH=parseInt(el('kH').value), kW=parseInt(el('kW').value)
+  X = zeros(H,W).map(row=>row.map(_=>randn()))
+  K = zeros(kH,kW).map(row=>row.map(_=>randn()))
+  renderAll()
+}
+el('compute').onclick = ()=>{
+  try{
+    renderAll()
+    el('status').innerHTML = '<span class="ok">已完成计算并在右侧展示。</span>'
+  }catch(e){
+    el('status').innerHTML = `<span class="bad">错误：${e.message}</span>`
+  }
+}
+window.onload = renderAll
+</script>
+</body>
+</html>
